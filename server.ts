@@ -33,19 +33,23 @@ db.exec(`
 
   CREATE TABLE IF NOT EXISTS products (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER NOT NULL,
     name TEXT NOT NULL,
     barcode TEXT UNIQUE,
     purchase_price REAL NOT NULL,
     selling_price REAL NOT NULL,
     quantity INTEGER NOT NULL DEFAULT 0,
-    low_stock_threshold INTEGER DEFAULT 5
+    low_stock_threshold INTEGER DEFAULT 5,
+    FOREIGN KEY (user_id) REFERENCES users(id)
   );
 
   CREATE TABLE IF NOT EXISTS sales (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER NOT NULL,
     total_amount REAL NOT NULL,
     total_profit REAL NOT NULL,
-    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (user_id) REFERENCES users(id)
   );
 
   CREATE TABLE IF NOT EXISTS sale_items (
@@ -61,17 +65,21 @@ db.exec(`
 
   CREATE TABLE IF NOT EXISTS expenses (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER NOT NULL,
     title TEXT NOT NULL,
     amount REAL NOT NULL,
     date DATE DEFAULT (DATE('now')),
-    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (user_id) REFERENCES users(id)
   );
 
   CREATE TABLE IF NOT EXISTS customers (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER NOT NULL,
     name TEXT NOT NULL,
     phone TEXT,
-    balance REAL DEFAULT 0
+    balance REAL DEFAULT 0,
+    FOREIGN KEY (user_id) REFERENCES users(id)
   );
 
   CREATE TABLE IF NOT EXISTS debts (
@@ -94,6 +102,21 @@ db.exec(`
     FOREIGN KEY (receiver_id) REFERENCES users(id)
   );
 `);
+
+// Migration: Add user_id to existing tables if missing
+const tablesToMigrate = ['products', 'sales', 'expenses', 'customers'];
+tablesToMigrate.forEach(table => {
+  const columns = db.prepare(`PRAGMA table_info(${table})`).all();
+  const hasUserId = columns.some((col: any) => col.name === 'user_id');
+  if (!hasUserId) {
+    try {
+      db.prepare(`ALTER TABLE ${table} ADD COLUMN user_id INTEGER DEFAULT 1`).run();
+      console.log(`Migrated table ${table}: added user_id column`);
+    } catch (err) {
+      console.error(`Failed to migrate table ${table}:`, err);
+    }
+  }
+});
 
 // Map to store active connections: userId -> WebSocket
 const clients = new Map<number, WebSocket>();
@@ -219,13 +242,13 @@ app.post("/api/auth/login", async (req, res) => {
 });
 
 // --- DASHBOARD STATS ---
-app.get("/api/stats", authenticateToken, (req, res) => {
-  const today = new Date().toISOString().split('T')[0];
+app.get("/api/stats", authenticateToken, (req: any, res) => {
+  const userId = req.user.id;
   
-  const salesToday: any = db.prepare("SELECT SUM(total_amount) as total, SUM(total_profit) as profit FROM sales WHERE DATE(created_at) = DATE('now')").get();
-  const expensesToday: any = db.prepare("SELECT SUM(amount) as total FROM expenses WHERE DATE(date) = DATE('now')").get();
-  const lowStock: any = db.prepare("SELECT COUNT(*) as count FROM products WHERE quantity <= low_stock_threshold").get();
-  const totalDebts: any = db.prepare("SELECT SUM(balance) as total FROM customers").get();
+  const salesToday: any = db.prepare("SELECT SUM(total_amount) as total, SUM(total_profit) as profit FROM sales WHERE user_id = ? AND DATE(created_at) = DATE('now')").get(userId);
+  const expensesToday: any = db.prepare("SELECT SUM(amount) as total FROM expenses WHERE user_id = ? AND DATE(date) = DATE('now')").get(userId);
+  const lowStock: any = db.prepare("SELECT COUNT(*) as count FROM products WHERE user_id = ? AND quantity <= low_stock_threshold").get(userId);
+  const totalDebts: any = db.prepare("SELECT SUM(balance) as total FROM customers WHERE user_id = ?").get(userId);
 
   res.json({
     salesToday: salesToday.total || 0,
@@ -237,52 +260,57 @@ app.get("/api/stats", authenticateToken, (req, res) => {
 });
 
 // --- PRODUCT ROUTES ---
-app.get("/api/products", authenticateToken, (req, res) => {
-  const products = db.prepare("SELECT * FROM products").all();
+app.get("/api/products", authenticateToken, (req: any, res) => {
+  const products = db.prepare("SELECT * FROM products WHERE user_id = ?").all(req.user.id);
   res.json(products);
 });
 
-app.post("/api/products", authenticateToken, (req, res) => {
+app.post("/api/products", authenticateToken, (req: any, res) => {
   const { name, barcode, purchase_price, selling_price, quantity, low_stock_threshold } = req.body;
+  const userId = req.user.id;
   try {
-    const stmt = db.prepare("INSERT INTO products (name, barcode, purchase_price, selling_price, quantity, low_stock_threshold) VALUES (?, ?, ?, ?, ?, ?)");
-    stmt.run(name, barcode, purchase_price, selling_price, quantity, low_stock_threshold);
+    const stmt = db.prepare("INSERT INTO products (user_id, name, barcode, purchase_price, selling_price, quantity, low_stock_threshold) VALUES (?, ?, ?, ?, ?, ?, ?)");
+    stmt.run(userId, name, barcode, purchase_price, selling_price, quantity, low_stock_threshold);
     res.status(201).json({ message: "Product added" });
   } catch (error: any) {
     res.status(400).json({ error: error.message });
   }
 });
 
-app.put("/api/products/:id", authenticateToken, (req, res) => {
+app.put("/api/products/:id", authenticateToken, (req: any, res) => {
   const { name, barcode, purchase_price, selling_price, quantity, low_stock_threshold } = req.body;
   const { id } = req.params;
+  const userId = req.user.id;
   try {
-    const stmt = db.prepare("UPDATE products SET name=?, barcode=?, purchase_price=?, selling_price=?, quantity=?, low_stock_threshold=? WHERE id=?");
-    stmt.run(name, barcode, purchase_price, selling_price, quantity, low_stock_threshold, id);
+    const stmt = db.prepare("UPDATE products SET name=?, barcode=?, purchase_price=?, selling_price=?, quantity=?, low_stock_threshold=? WHERE id=? AND user_id=?");
+    const result = stmt.run(name, barcode, purchase_price, selling_price, quantity, low_stock_threshold, id, userId);
+    if (result.changes === 0) return res.status(404).json({ error: "Product not found" });
     res.json({ message: "Product updated" });
   } catch (error: any) {
     res.status(400).json({ error: error.message });
   }
 });
 
-app.delete("/api/products/:id", authenticateToken, (req, res) => {
-  db.prepare("DELETE FROM products WHERE id = ?").run(req.params.id);
+app.delete("/api/products/:id", authenticateToken, (req: any, res) => {
+  const result = db.prepare("DELETE FROM products WHERE id = ? AND user_id = ?").run(req.params.id, req.user.id);
+  if (result.changes === 0) return res.status(404).json({ error: "Product not found" });
   res.json({ message: "Product deleted" });
 });
 
 // --- POS ROUTES ---
-app.post("/api/sales", authenticateToken, (req, res) => {
+app.post("/api/sales", authenticateToken, (req: any, res) => {
   const { items } = req.body; // items: [{id, quantity}]
+  const userId = req.user.id;
   
   const transaction = db.transaction(() => {
     let totalAmount = 0;
     let totalProfit = 0;
 
-    const saleStmt = db.prepare("INSERT INTO sales (total_amount, total_profit) VALUES (?, ?)");
-    const { lastInsertRowid: saleId } = saleStmt.run(0, 0);
+    const saleStmt = db.prepare("INSERT INTO sales (user_id, total_amount, total_profit) VALUES (?, ?, ?)");
+    const { lastInsertRowid: saleId } = saleStmt.run(userId, 0, 0);
 
     for (const item of items) {
-      const product: any = db.prepare("SELECT * FROM products WHERE id = ?").get(item.id);
+      const product: any = db.prepare("SELECT * FROM products WHERE id = ? AND user_id = ?").get(item.id, userId);
       if (!product || product.quantity < item.quantity) {
         throw new Error(`Insufficient stock for ${product?.name || 'unknown product'}`);
       }
@@ -296,12 +324,12 @@ app.post("/api/sales", authenticateToken, (req, res) => {
       db.prepare("INSERT INTO sale_items (sale_id, product_id, quantity, price, profit) VALUES (?, ?, ?, ?, ?)")
         .run(saleId, item.id, item.quantity, product.selling_price, itemProfit);
 
-      db.prepare("UPDATE products SET quantity = quantity - ? WHERE id = ?")
-        .run(item.quantity, item.id);
+      db.prepare("UPDATE products SET quantity = quantity - ? WHERE id = ? AND user_id = ?")
+        .run(item.quantity, item.id, userId);
     }
 
-    db.prepare("UPDATE sales SET total_amount = ?, total_profit = ? WHERE id = ?")
-      .run(totalAmount, totalProfit, saleId);
+    db.prepare("UPDATE sales SET total_amount = ?, total_profit = ? WHERE id = ? AND user_id = ?")
+      .run(totalAmount, totalProfit, saleId, userId);
 
     return { saleId, totalAmount, totalProfit };
   });
@@ -315,47 +343,65 @@ app.post("/api/sales", authenticateToken, (req, res) => {
 });
 
 // --- EXPENSE ROUTES ---
-app.get("/api/expenses", authenticateToken, (req, res) => {
-  const expenses = db.prepare("SELECT * FROM expenses ORDER BY created_at DESC").all();
+app.get("/api/expenses", authenticateToken, (req: any, res) => {
+  const expenses = db.prepare("SELECT * FROM expenses WHERE user_id = ? ORDER BY created_at DESC").all(req.user.id);
   res.json(expenses);
 });
 
-app.post("/api/expenses", authenticateToken, (req, res) => {
+app.post("/api/expenses", authenticateToken, (req: any, res) => {
   const { title, amount, date } = req.body;
-  db.prepare("INSERT INTO expenses (title, amount, date) VALUES (?, ?, ?)").run(title, amount, date || null);
+  const userId = req.user.id;
+  db.prepare("INSERT INTO expenses (user_id, title, amount, date) VALUES (?, ?, ?, ?)").run(userId, title, amount, date || null);
   res.status(201).json({ message: "Expense added" });
 });
 
 // --- CUSTOMER & DEBT ROUTES ---
-app.get("/api/customers", authenticateToken, (req, res) => {
-  const customers = db.prepare("SELECT * FROM customers").all();
+app.get("/api/customers", authenticateToken, (req: any, res) => {
+  const customers = db.prepare("SELECT * FROM customers WHERE user_id = ?").all(req.user.id);
   res.json(customers);
 });
 
-app.post("/api/customers", authenticateToken, (req, res) => {
+app.post("/api/customers", authenticateToken, (req: any, res) => {
   const { name, phone } = req.body;
-  db.prepare("INSERT INTO customers (name, phone) VALUES (?, ?)").run(name, phone);
+  const userId = req.user.id;
+  db.prepare("INSERT INTO customers (user_id, name, phone) VALUES (?, ?, ?)").run(userId, name, phone);
   res.status(201).json({ message: "Customer added" });
 });
 
-app.post("/api/debts", authenticateToken, (req, res) => {
+app.post("/api/debts", authenticateToken, (req: any, res) => {
   const { customer_id, amount, type, description } = req.body; // type: 'DEBT' or 'PAYMENT'
+  const userId = req.user.id;
   
   const transaction = db.transaction(() => {
+    // Verify customer belongs to user
+    const customer: any = db.prepare("SELECT id FROM customers WHERE id = ? AND user_id = ?").get(customer_id, userId);
+    if (!customer) throw new Error("Customer not found");
+
     db.prepare("INSERT INTO debts (customer_id, amount, type, description) VALUES (?, ?, ?, ?)")
       .run(customer_id, amount, type, description);
     
     const balanceChange = type === 'DEBT' ? amount : -amount;
-    db.prepare("UPDATE customers SET balance = balance + ? WHERE id = ?")
-      .run(balanceChange, customer_id);
+    db.prepare("UPDATE customers SET balance = balance + ? WHERE id = ? AND user_id = ?")
+      .run(balanceChange, customer_id, userId);
   });
 
-  transaction();
-  res.status(201).json({ message: "Debt record updated" });
+  try {
+    transaction();
+    res.status(201).json({ message: "Debt record updated" });
+  } catch (error: any) {
+    res.status(400).json({ error: error.message });
+  }
 });
 
-app.get("/api/customers/:id/history", authenticateToken, (req, res) => {
-  const history = db.prepare("SELECT * FROM debts WHERE customer_id = ? ORDER BY created_at DESC").all(req.params.id);
+app.get("/api/customers/:id/history", authenticateToken, (req: any, res) => {
+  const userId = req.user.id;
+  const customerId = req.params.id;
+
+  // Verify customer belongs to user
+  const customer: any = db.prepare("SELECT id FROM customers WHERE id = ? AND user_id = ?").get(customerId, userId);
+  if (!customer) return res.status(404).json({ error: "Customer not found" });
+
+  const history = db.prepare("SELECT * FROM debts WHERE customer_id = ? ORDER BY created_at DESC").all(customerId);
   res.json(history);
 });
 
@@ -376,36 +422,6 @@ app.get("/api/chat/:otherUserId", authenticateToken, (req: any, res) => {
   `).all(userId, otherUserId, otherUserId, userId);
   res.json(messages);
 });
-
-// message deletion endpoint
-app.delete("/api/messages/:id", authenticateToken, (req: any, res) => {
-  const userId = req.user.id;
-  const msgId = req.params.id;
-  const msg = db.prepare("SELECT * FROM messages WHERE id = ?").get(msgId);
-  if (!msg) {
-    return res.status(404).json({ error: "Message not found" });
-  }
-  if (msg.sender_id !== userId) {
-    return res.status(403).json({ error: "Not authorized to delete this message" });
-  }
-
-  db.prepare("DELETE FROM messages WHERE id = ?").run(msgId);
-
-  // notify involved parties via websocket
-  broadcastMessageDeleted(msgId, msg.receiver_id);
-  broadcastMessageDeleted(msgId, msg.sender_id);
-
-  res.json({ message: "Deleted" });
-});
-
-// helper for ws broadcast
-function broadcastMessageDeleted(messageId: number, userId: number | null) {
-  if (!userId) return;
-  const client = clients.get(userId);
-  if (client && client.readyState === WebSocket.OPEN) {
-    client.send(JSON.stringify({ type: 'MESSAGE_DELETED', messageId }));
-  }
-}
 
 // Vite middleware for development
 async function startServer() {

@@ -43,18 +43,38 @@ function cn(...inputs: ClassValue[]) {
 
 const API_URL = '/api';
 
+let currentSessionId: string | null = null;
+
 const fetchWithAuth = async (url: string, options: any = {}) => {
   const token = localStorage.getItem('token');
+  const sessionId = localStorage.getItem('sessionId');
+  
+  // Validate session hasn't changed (user logged out elsewhere)
+  if (sessionId && currentSessionId && sessionId !== currentSessionId) {
+    localStorage.clear();
+    sessionStorage.clear();
+    window.location.href = '/login';
+    return Promise.reject(new Error('Session invalidated'));
+  }
+  
+  currentSessionId = sessionId;
+  
   const headers = {
     'Content-Type': 'application/json',
     ...(token ? { 'Authorization': `Bearer ${token}` } : {}),
     ...options.headers,
   };
+  
   const response = await fetch(`${API_URL}${url}`, { ...options, headers });
-  if (response.status === 401) {
-    localStorage.removeItem('token');
+  
+  if (response.status === 401 || response.status === 403) {
+    localStorage.clear();
+    sessionStorage.clear();
+    currentSessionId = null;
     window.location.href = '/login';
+    return Promise.reject(new Error('Unauthorized'));
   }
+  
   return response;
 };
 
@@ -64,23 +84,46 @@ const AuthContext = createContext<any>(null);
 const AuthProvider = ({ children }: { children: React.ReactNode }) => {
   const [user, setUser] = useState<any>(JSON.parse(localStorage.getItem('user') || 'null'));
   const [token, setToken] = useState(localStorage.getItem('token'));
+  const [sessionId] = useState(() => Math.random().toString(36).substring(7));
 
   const login = (userData: any, userToken: string) => {
+    // Clear any previous user data first
+    localStorage.clear();
+    // Set new user data
     setUser(userData);
     setToken(userToken);
     localStorage.setItem('user', JSON.stringify(userData));
     localStorage.setItem('token', userToken);
+    localStorage.setItem('sessionId', sessionId);
   };
 
-  const logout = () => {
+  const logout = async () => {
+    const token = localStorage.getItem('token');
+    
+    // Call logout API to blacklist the token on server
+    if (token) {
+      try {
+        await fetch(`${API_URL}/auth/logout`, {
+          method: 'POST',
+          headers: {
+            'Authorization': `Bearer ${token}`,
+            'Content-Type': 'application/json'
+          }
+        }).catch(() => {}); // Ignore errors, cleanup locally anyway
+      } catch (err) {
+        // Silently fail - local cleanup still happens
+      }
+    }
+    
     setUser(null);
     setToken(null);
-    localStorage.removeItem('user');
-    localStorage.removeItem('token');
+    localStorage.clear();
+    sessionStorage.clear();
+    currentSessionId = null;
   };
 
   return (
-    <AuthContext.Provider value={{ user, token, login, logout }}>
+    <AuthContext.Provider value={{ user, token, login, logout, sessionId }}>
       {children}
     </AuthContext.Provider>
   );
@@ -335,7 +378,13 @@ const RegisterPage = () => {
 const DashboardLayout = ({ children }: { children: React.ReactNode }) => {
   const { logout, user } = useAuth();
   const location = useLocation();
+  const navigate = useNavigate();
   const [sidebarOpen, setSidebarOpen] = useState(false);
+
+  const handleLogout = () => {
+    logout();
+    navigate('/login', { replace: true });
+  };
 
   const links = [
     { to: '/dashboard', icon: LayoutDashboard, label: 'لوحة التحكم' },
@@ -382,7 +431,7 @@ const DashboardLayout = ({ children }: { children: React.ReactNode }) => {
               </div>
             </div>
             <button 
-              onClick={logout}
+              onClick={handleLogout}
               className="w-full flex items-center gap-3 px-4 py-3 text-red-500 hover:bg-red-50 rounded-xl transition-colors font-medium"
             >
               <LogOut className="w-5 h-5" />
