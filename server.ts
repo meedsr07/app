@@ -377,6 +377,36 @@ app.get("/api/chat/:otherUserId", authenticateToken, (req: any, res) => {
   res.json(messages);
 });
 
+// message deletion endpoint
+app.delete("/api/messages/:id", authenticateToken, (req: any, res) => {
+  const userId = req.user.id;
+  const msgId = req.params.id;
+  const msg = db.prepare("SELECT * FROM messages WHERE id = ?").get(msgId);
+  if (!msg) {
+    return res.status(404).json({ error: "Message not found" });
+  }
+  if (msg.sender_id !== userId) {
+    return res.status(403).json({ error: "Not authorized to delete this message" });
+  }
+
+  db.prepare("DELETE FROM messages WHERE id = ?").run(msgId);
+
+  // notify involved parties via websocket
+  broadcastMessageDeleted(msgId, msg.receiver_id);
+  broadcastMessageDeleted(msgId, msg.sender_id);
+
+  res.json({ message: "Deleted" });
+});
+
+// helper for ws broadcast
+function broadcastMessageDeleted(messageId: number, userId: number | null) {
+  if (!userId) return;
+  const client = clients.get(userId);
+  if (client && client.readyState === WebSocket.OPEN) {
+    client.send(JSON.stringify({ type: 'MESSAGE_DELETED', messageId }));
+  }
+}
+
 // Vite middleware for development
 async function startServer() {
   if (process.env.NODE_ENV !== "production") {

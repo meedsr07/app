@@ -1,4 +1,4 @@
-import React, { useState, useEffect, createContext, useContext } from 'react';
+import React, { useState, useEffect, useRef, createContext, useContext } from 'react';
 import { 
   BrowserRouter as Router, 
   Routes, 
@@ -1086,77 +1086,129 @@ const CustomersPage = () => {
 
 const ChatPage = () => {
   const { user, token } = useAuth();
+
   const [users, setUsers] = useState<any[]>([]);
   const [onlineUserIds, setOnlineUserIds] = useState<number[]>([]);
-  const [selectedUser, setSelectedUser] = useState<any>(null);
+  const [selectedChat, setSelectedChat] = useState<any>(null);
   const [messages, setMessages] = useState<any[]>([]);
   const [input, setInput] = useState('');
   const [socket, setSocket] = useState<WebSocket | null>(null);
-  const messagesEndRef = React.useRef<HTMLDivElement>(null);
-  const inputRef = React.useRef<HTMLInputElement>(null);
 
+  const [isGroupModalOpen, setIsGroupModalOpen] = useState(false);
+  const [selectedGroupUsers, setSelectedGroupUsers] = useState<number[]>([]);
+  const [groupName, setGroupName] = useState('');
+
+  const messagesEndRef = useRef<HTMLDivElement>(null);
+  const inputRef = useRef<HTMLInputElement>(null);
+  const selectedChatRef = useRef<any>(selectedChat);
+
+  useEffect(() => {
+    selectedChatRef.current = selectedChat;
+  }, [selectedChat]);
+
+  /* -------------------- Scroll -------------------- */
   const scrollToBottom = () => {
-    messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
+    messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
   };
 
   useEffect(() => {
     scrollToBottom();
   }, [messages]);
 
+  /* -------------------- Load Users -------------------- */
   useEffect(() => {
-    fetchWithAuth('/users').then(res => res.json()).then(data => setUsers(data.filter((u: any) => u.id !== user.id)));
+    fetchWithAuth('/users')
+      .then(res => res.json())
+      .then(data => setUsers(data.filter((u: any) => u.id !== user.id)));
+  }, []);
 
+  /* -------------------- WebSocket -------------------- */
+  useEffect(() => {
     const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
     const ws = new WebSocket(`${protocol}//${window.location.host}?token=${token}`);
-    
+
     ws.onmessage = (event) => {
       const data = JSON.parse(event.data);
+
       if (data.type === 'ONLINE_USERS') {
         setOnlineUserIds(data.users);
-      } else if (data.type === 'NEW_MESSAGE' || data.type === 'MESSAGE_SENT') {
+        return;
+      }
+
+      if (data.type === 'NEW_MESSAGE') {
         const msg = data.message;
-        // Only update if it's for the current chat
-        setMessages(prev => {
-          const isRelevant = (msg.sender_id === user.id && msg.receiver_id === selectedUser?.id) ||
-                            (msg.sender_id === selectedUser?.id && msg.receiver_id === user.id);
-          if (isRelevant || data.type === 'MESSAGE_SENT') {
-             // If it's a message we sent, we always want to see it if we're in that chat
-             if ((msg.sender_id === user.id && msg.receiver_id === selectedUser?.id) || 
-                 (msg.sender_id === selectedUser?.id && msg.receiver_id === user.id)) {
-               return [...prev, msg];
-             }
-          }
-          return prev;
-        });
+        const sc = selectedChatRef.current;
+        const isCurrentChat =
+          sc &&
+          (
+            (msg.sender_id === user.id && msg.receiver_id === sc.id) ||
+            (msg.sender_id === sc.id && msg.receiver_id === user.id) ||
+            msg.group_id === sc.id
+          );
+
+        if (isCurrentChat) {
+          setMessages(prev => [...prev, msg]);
+        }
+      }
+
+      if (data.type === 'MESSAGE_DELETED') {
+        const msgId = data.messageId;
+        setMessages(prev => prev.filter(m => m.id !== msgId));
       }
     };
 
     setSocket(ws);
     return () => ws.close();
-  }, [token, user.id]);
+  }, [token]);
 
+  /* -------------------- Load Messages -------------------- */
   useEffect(() => {
-    if (selectedUser) {
-      fetchWithAuth(`/chat/${selectedUser.id}`).then(res => res.json()).then(data => setMessages(data));
-      // focus the input when we open a chat
-      inputRef.current?.focus();
-    }
-  }, [selectedUser]);
+    if (!selectedChat) return;
 
-  const sendMessage = (e: any) => {
-    e.preventDefault();
-    if (!input.trim() || !selectedUser || !socket) return;
+    const endpoint = selectedChat.isGroup
+      ? `/groups/${selectedChat.id}/messages`
+      : `/chat/${selectedChat.id}`;
 
-    const payload = {
-      type: 'CHAT_MESSAGE',
-      receiverId: selectedUser.id,
-      content: input
+    fetchWithAuth(endpoint)
+      .then(res => res.json())
+      .then(data => setMessages(data));
+
+    inputRef.current?.focus();
+  }, [selectedChat]);
+
+  /* -------------------- Send Message -------------------- */
+  const sendMessage = (e?: React.SyntheticEvent | any) => {
+    // prevent any default behavior (form submit, key press)
+    if (e && e.preventDefault) e.preventDefault();
+    if (!input.trim() || !selectedChat || !socket) return;
+
+    const tempMessage = {
+      id: Date.now(),
+      sender_id: user.id,
+      receiver_id: selectedChat.isGroup ? null : selectedChat.id,
+      group_id: selectedChat.isGroup ? selectedChat.id : null,
+      content: input,
+      created_at: new Date().toISOString(),
     };
 
-    socket.send(JSON.stringify(payload));
+    // Optimistic UI (WhatsApp style)
+    setMessages(prev => [...prev, tempMessage]);
+
+    try {
+      socket.send(JSON.stringify({
+        type: 'CHAT_MESSAGE',
+        receiverId: selectedChat.isGroup ? null : selectedChat.id,
+        groupId: selectedChat.isGroup ? selectedChat.id : null,
+        content: input
+      }));
+    } catch (err) {
+      console.error('Socket send failed:', err);
+    }
+
     setInput('');
   };
 
+  /* -------------------- Delete Message -------------------- */
   const deleteMessage = async (messageId: number) => {
     try {
       await fetchWithAuth(`/api/messages/${messageId}`, { method: 'DELETE' });
@@ -1166,79 +1218,85 @@ const ChatPage = () => {
     }
   };
 
+  /* -------------------- Create Group -------------------- */
+  const createGroup = async () => {
+    if (!groupName || selectedGroupUsers.length === 0) return;
+
+    const res = await fetchWithAuth('/groups', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        name: groupName,
+        members: selectedGroupUsers
+      })
+    });
+
+    const data = await res.json();
+
+    setUsers(prev => [...prev, { ...data, isGroup: true }]);
+    setIsGroupModalOpen(false);
+    setGroupName('');
+    setSelectedGroupUsers([]);
+  };
+
+  /* -------------------- UI -------------------- */
   return (
     <div className="h-full flex gap-6 overflow-hidden">
-      {/* Users List */}
-      <div className="w-80 bg-white rounded-3xl shadow-sm border border-gray-100 flex flex-col overflow-hidden">
-        <div className="p-6 border-b border-gray-100 bg-emerald-50/50">
-          <h3 className="text-xl font-bold text-gray-800">المستخدمين</h3>
+
+      {/* Users / Groups List */}
+      <div className="w-80 bg-white rounded-3xl shadow border flex flex-col overflow-hidden">
+
+        <div className="p-6 border-b flex justify-between items-center">
+          <h3 className="font-bold">المحادثات</h3>
+          <button
+            onClick={() => setIsGroupModalOpen(true)}
+            className="bg-emerald-600 text-white px-3 py-2 rounded-xl text-sm"
+          >
+            مجموعة +
+          </button>
         </div>
+
         <div className="flex-1 overflow-y-auto p-4 space-y-2">
           {users.map(u => (
-            <button 
+            <button
               key={u.id}
-              onClick={() => setSelectedUser(u)}
-              className={cn(
-                "w-full p-4 rounded-2xl flex items-center gap-3 transition-all",
-                selectedUser?.id === u.id ? "bg-emerald-600 text-white shadow-lg shadow-emerald-100" : "hover:bg-emerald-50 text-gray-700"
-              )}
+              onClick={() => setSelectedChat(u)}
+              className="w-full p-3 rounded-xl hover:bg-emerald-50 text-right"
             >
-              <div className="relative">
-                <div className={cn("w-10 h-10 rounded-full flex items-center justify-center font-bold", selectedUser?.id === u.id ? "bg-white/20" : "bg-emerald-100 text-emerald-600")}>
-                  {u.full_name[0]}
-                </div>
-                {onlineUserIds.includes(u.id) && (
-                  <div className="absolute bottom-0 right-0 w-3 h-3 bg-green-500 border-2 border-white rounded-full"></div>
-                )}
-              </div>
-              <div className="text-right overflow-hidden">
-                <p className="font-bold text-sm truncate">{u.full_name}</p>
-                <p className={cn("text-xs truncate", selectedUser?.id === u.id ? "text-white/70" : "text-gray-400")}>
+              <p className="font-semibold">{u.full_name || u.name}</p>
+              {!u.isGroup && (
+                <p className="text-xs text-gray-400">
                   {onlineUserIds.includes(u.id) ? 'متصل الآن' : 'غير متصل'}
                 </p>
-              </div>
+              )}
             </button>
           ))}
         </div>
       </div>
 
       {/* Chat Window */}
-      <div className="flex-1 bg-white rounded-3xl shadow-sm border border-gray-100 flex flex-col overflow-hidden">
-        {selectedUser ? (
+      <div className="flex-1 bg-white rounded-3xl shadow flex flex-col overflow-hidden">
+
+        {selectedChat ? (
           <>
-            <div className="p-6 border-b border-gray-100 flex items-center justify-between">
-              <div className="flex items-center gap-3">
-                <div className="w-10 h-10 bg-emerald-100 rounded-full flex items-center justify-center text-emerald-600 font-bold">
-                  {selectedUser.full_name[0]}
-                </div>
-                <div>
-                  <h3 className="font-bold text-gray-800">محادثة مع {selectedUser.full_name}</h3>
-                  <p className="text-xs text-gray-400">@{selectedUser.username}</p>
-                </div>
-              </div>
+            <div className="p-6 border-b font-bold">
+              {selectedChat.full_name || selectedChat.name}
             </div>
 
-            <div className="flex-1 overflow-y-auto p-6 space-y-4 bg-gray-50/50">
-              {messages.length === 0 && (
-                <p className="text-center text-gray-400 mt-10">لا توجد رسائل بعد</p>
-              )}
-              {messages.map((msg, i) => (
-                <motion.div
-                  key={i}
-                  initial={{ opacity: 0, y: 10 }}
-                  animate={{ opacity: 1, y: 0 }}
-                  transition={{ type: 'spring', stiffness: 300, damping: 25 }}
-                  className={cn("flex group", msg.sender_id === user.id ? "justify-start gap-2" : "justify-end")}
+            <div className="flex-1 overflow-y-auto p-6 space-y-4 bg-gray-50">
+              {messages.map(msg => (
+                <div
+                  key={msg.id}
+                  className={`flex group ${msg.sender_id === user.id ? 'justify-start gap-2' : 'justify-end'}`}
                 >
-                  <div className={cn(
-                    "max-w-[70%] p-4 rounded-2xl shadow-sm",
+                  <div className={`max-w-[70%] p-4 rounded-2xl ${
                     msg.sender_id === user.id
-                      ? "bg-emerald-600 text-white rounded-bl-none text-left"
-                      : "bg-white text-gray-800 rounded-br-none border border-gray-100"
-                  )}>
-                    <p className="text-sm leading-relaxed">{msg.content}</p>
-                    <p className={cn("text-[10px] mt-1", msg.sender_id === user.id ? "text-white/60" : "text-gray-400")}>
-                      {new Date(msg.created_at).toLocaleTimeString('ar-EG', { hour: '2-digit', minute: '2-digit' })}
+                      ? 'bg-emerald-600 text-white'
+                      : 'bg-white border'
+                  }`}>
+                    <p>{msg.content}</p>
+                    <p className="text-[10px] mt-1 opacity-60">
+                      {new Date(msg.created_at).toLocaleTimeString()}
                     </p>
                   </div>
                   {msg.sender_id === user.id && (
@@ -1250,32 +1308,84 @@ const ChatPage = () => {
                       <Trash2 className="w-4 h-4 text-red-500" />
                     </button>
                   )}
-                </motion.div>
+                </div>
               ))}
               <div ref={messagesEndRef} />
             </div>
 
-            <form onSubmit={sendMessage} className="p-6 border-t border-gray-100 flex gap-4">
-              <input 
+            <div className="p-4 border-t flex gap-3">
+              <input
                 ref={inputRef}
-                type="text" 
-                placeholder="اكتب رسالتك هنا..." 
-                className="flex-1 px-6 py-4 bg-gray-50 rounded-2xl outline-none focus:ring-2 focus:ring-emerald-200"
+                type="text"
+                className="flex-1 px-4 py-3 rounded-xl bg-gray-100"
+                placeholder="اكتب رسالة..."
                 value={input}
                 onChange={(e) => setInput(e.target.value)}
+                onKeyDown={(e) => {
+                  if (e.key === 'Enter') {
+                    sendMessage(e);
+                  }
+                }}
               />
-              <button type="submit" className="p-4 bg-emerald-600 text-white rounded-2xl hover:bg-emerald-700 shadow-lg shadow-emerald-100 transition-all">
-                <Send className="w-6 h-6" />
+              <button
+                type="button"
+                onClick={sendMessage}
+                className="bg-emerald-600 text-white px-6 rounded-xl"
+              >
+                إرسال
               </button>
-            </form>
+            </div>
           </>
         ) : (
-          <div className="flex-1 flex flex-col items-center justify-center text-gray-400 gap-4">
-            <MessageSquare className="w-16 h-16 opacity-10" />
-            <p className="text-lg">اختر مستخدماً لبدء المحادثة</p>
+          <div className="flex-1 flex items-center justify-center text-gray-400">
+            اختر محادثة
           </div>
         )}
       </div>
+
+      {/* Group Modal */}
+      {isGroupModalOpen && (
+        <div className="fixed inset-0 bg-black/40 flex items-center justify-center">
+          <div className="bg-white w-96 p-6 rounded-3xl space-y-4">
+            <h3 className="font-bold">إنشاء مجموعة</h3>
+
+            <input
+              type="text"
+              placeholder="اسم المجموعة"
+              className="w-full px-4 py-2 border rounded-xl"
+              value={groupName}
+              onChange={(e) => setGroupName(e.target.value)}
+            />
+
+            <div className="max-h-40 overflow-y-auto space-y-2">
+              {users.filter(u => !u.isGroup).map(u => (
+                <label key={u.id} className="flex gap-2 items-center">
+                  <input
+                    type="checkbox"
+                    onChange={(e) => {
+                      if (e.target.checked)
+                        setSelectedGroupUsers(prev => [...prev, u.id]);
+                      else
+                        setSelectedGroupUsers(prev => prev.filter(id => id !== u.id));
+                    }}
+                  />
+                  {u.full_name}
+                </label>
+              ))}
+            </div>
+
+            <div className="flex justify-end gap-3">
+              <button onClick={() => setIsGroupModalOpen(false)}>إلغاء</button>
+              <button
+                onClick={createGroup}
+                className="bg-emerald-600 text-white px-4 py-2 rounded-xl"
+              >
+                إنشاء
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 };
